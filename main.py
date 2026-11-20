@@ -1,35 +1,56 @@
-import os
 import time
 import urllib.request
 import base64
 import socket
 import json
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 
-SOURCE_URL = "https://github.com/PizdukMod/PizdukVPN/raw/refs/heads/main/sub"
+# --- СЮДА ДОБАВЛЯЙ СВОИ ССЫЛКИ ---
+SOURCE_URLS = [
+    "https://github.com/PizdukMod/PizdukVPN/raw/refs/heads/main/sub",
+    # "https://твой-второй-источник.com/sub.txt",
+    # "https://github.com/другой-ник/другой-репо/raw/main/configs.txt"
+]
+# --------------------------------
+
 OUTPUT_FILE = "sub.txt"
 
-def get_source_configs():
+def get_configs_from_url(url):
+    """Скачивает и парсит один источник"""
     try:
-        req = urllib.request.Request(SOURCE_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
             content = response.read().decode('utf-8')
+            
+            # Пытаемся раскодировать base64, если это подписка
             try:
                 decoded = base64.b64decode(content).decode('utf-8')
                 if '://' in decoded:
                     content = decoded
             except:
                 pass
-            return [line.strip() for line in content.splitlines() if '://' in line]
+            
+            # Ищем только строки с конфигами
+            lines = [line.strip() for line in content.splitlines() if '://' in line]
+            print(f"[{url[:30]}...] Найдено {len(lines)} конфигов.")
+            return lines
     except Exception as e:
-        print(f"Ошибка скачивания: {e}")
+        print(f"[ОШИБКА] Не удалось скачать {url[:30]}... : {e}")
         return []
 
+def get_all_configs():
+    """Собирает конфиги со всех источников в один список (без дублей)"""
+    all_configs = set() # set автоматически убирает дубликаты
+    for url in SOURCE_URLS:
+        configs = get_configs_from_url(url)
+        for c in configs:
+            all_configs.add(c)
+    
+    return list(all_configs)
+
 def get_host_port(uri):
-    """Вытаскиваем IP и порт из ссылки"""
     if uri.startswith("vmess://"):
         try:
             b64 = uri[8:]
@@ -46,8 +67,7 @@ def get_host_port(uri):
         except: pass
     return None
 
-def tcp_ping(host_port):
-    """Проверка открыт ли порт (TCP Handshake)"""
+def tcp_ping_once(host_port):
     if not host_port:
         return -1
     host, port = host_port
@@ -58,84 +78,65 @@ def tcp_ping(host_port):
     except:
         return -1
 
+def check_server(uri, host_port):
+    pings = []
+    successes = 0
+    
+    for _ in range(5):
+        ping = tcp_ping_once(host_port)
+        if ping > 0:
+            pings.append(ping)
+            successes += 1
+        time.sleep(0.05)
+    
+    if successes >= 4:
+        avg_ping = statistics.mean(pings)
+        if avg_ping < 3000:
+            return uri, avg_ping
+    return None, -1
+
 def main():
-    print("--- ЭТАП 1: Быстрый TCP-тест ---")
-    raw_configs = get_source_configs()
+    print("Скачиваем конфиги со всех источников...")
+    raw_configs = get_all_configs()
     if not raw_configs:
+        print("Нет конфигов! Проверь ссылки в SOURCE_URLS.")
         return
 
+    print(f"\nВсего уникальных конфигов: {len(raw_configs)}. Извлекаем IP и порты...")
+    
     parsed_data = []
     for uri in raw_configs:
         hp = get_host_port(uri)
         if hp:
             parsed_data.append((uri, hp))
 
-    print(f"Всего серверов: {len(parsed_data)}. Проверяем порты...")
+    print(f"Запускаем 5-кратный параллельный пинг для {len(parsed_data)} серверов...\n")
     
-    alive_data = []
-    # Проверяем TCP параллельно в 50 потоков
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        future_to_data = {executor.submit(tcp_ping, hp): (uri, hp) for uri, hp in parsed_data}
-        for future in future_to_data:
-            uri, hp = future_to_data[future]
-            ping = future.result()
-            if ping > 0 and ping < 2000: # Порт открыт и отвечает быстро
-                alive_data.append((uri, ping))
-
-    print(f"Порты открыты у {len(alive_data)} серверов.")
-
-    # Сортируем по TCP-пингу (самые быстрые в начале)
-    alive_data.sort(key=lambda x: x[1])
-    
-    # Берем топ-100 самых быстрых, чтобы python-v2ray не сдох по таймауту
-    top_alive = alive_data[:100]
-    top_uris = [data[0] for data in top_alive]
-
-    print(f"\n--- ЭТАП 2: Точный пинг через Xray (Топ-{len(top_uris)}) ---")
-    
-    # Импортируем тяжелые библиотеки только сейчас
-    from python_v2ray.downloader import BinaryDownloader
-    from python_v2ray.tester import ConnectionTester
-    from python_v2ray.config_parser import parse_uri
-
-    project_root = Path("./")
-    downloader = BinaryDownloader(project_root)
-    downloader.ensure_all()
-    
-    tester = ConnectionTester(
-        vendor_path=str(project_root / "vendor"),
-        core_engine_path=str(project_root / "core_engine")
-    )
-
-    parsed_configs = [parse_uri(uri) for uri in top_uris]
-    parsed_configs = [p for p in parsed_configs if p]
-
     good_uris = []
     
-    # Тестируем пачкой (python-v2ray умеет тестировать список)
-    try:
-        results = tester.test_uris(parsed_configs)
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        future_to_uri = {executor.submit(check_server, uri, hp): uri for uri, hp in parsed_data}
         
-        # Сопоставляем результаты с URI
-        for i, res in enumerate(results):
-            if i >= len(top_uris): break
+        completed = 0
+        for future in future_to_uri:
+            uri = future_to_uri[future]
+            completed += 1
             
-            real_ping = res.get('ping_ms', -1)
-            if real_ping > 0 and real_ping < 3000:
-                print(f"[OK] {top_uris[i][:30]}... | TCP: {top_alive[i][1]:.0f}ms | Real: {real_ping:.0f}ms")
-                good_uris.append(top_uris[i])
-            else:
-                print(f"[DEAD] {top_uris[i][:30]}... | Real Ping не прошел")
+            if completed % 10 == 0 or completed == len(parsed_data):
+                print(f"Проверено {completed} из {len(parsed_data)}...")
                 
-    except Exception as e:
-        print(f"Ошибка при точном тесте: {e}")
-        # Если Xray упал, берем хотя бы те, что прошли TCP
-        good_uris = top_uris
+            try:
+                result_uri, avg_ping = future.result()
+                if result_uri:
+                    print(f"[OK] {result_uri[:30]}... | Средний пинг: {avg_ping:.0f}ms")
+                    good_uris.append(result_uri)
+            except Exception:
+                pass
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(good_uris))
         
-    print(f"\nГотово! В итоговый файл записано {len(good_uris)} серверов.")
+    print(f"\nГотово! Отфильтровано {len(good_uris)} серверов. Записано в {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
