@@ -2,7 +2,7 @@ name: Update VPN Sub
 
 on:
   schedule:
-    - cron: '*/10 * * * *' # Твои 10 минут
+    - cron: '0 */2 * * *' # Твои 10 минут
   workflow_dispatch: # Кнопка ручного запуска
 
 jobs:
