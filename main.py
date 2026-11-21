@@ -91,7 +91,7 @@ def check_server(uri, host_port):
     
     if successes >= 4:
         avg_ping = statistics.mean(pings)
-        if avg_ping < 850:
+        if avg_ping < 500:
             return uri, avg_ping
     return None, -1
 
