@@ -12,7 +12,6 @@ SOURCE_URLS = [
     "https://github.com/PizdukMod/PizdukVPN/raw/refs/heads/main/sub",
     # Добавлена вторая ссылка. Замени на реальную ссылку, если нужна другая.
     # Пример: "https://raw.githubusercontent.com/someuser/somevpnlist/main/sub.txt"
-    "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt" 
 ]
 # ----------------------------------------------
 
