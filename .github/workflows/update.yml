@@ -13,7 +13,7 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@c99b5657763944f7273a038d216e22755ed6bda2
         
       - name: Run Filter Script
         run: python3 main.py
