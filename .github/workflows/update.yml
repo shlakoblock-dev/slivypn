@@ -25,3 +25,4 @@ jobs:
           git add sub.txt
           git commit -m "Auto-update VPN servers" || echo "No changes to commit"
           git push
+# сливы
