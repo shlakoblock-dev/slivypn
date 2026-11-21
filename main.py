@@ -79,7 +79,7 @@ def check_server(uri, host_port):
     
     if successes >= 4:
         avg_ping = statistics.mean(pings)
-        if avg_ping < 3000:
+        if avg_ping < 250:
             return uri, avg_ping
     return None, -1
 
@@ -111,7 +111,7 @@ def main():
     header = (
         "#profile-title: Sлiвы VPN ~ Drun Tier\n"
         "#profile-update-interval: 1\n"
-        "#profile-desc: Подписка автообновляется и чекает пинг. Просто нажми Обновить.\n"
+        "#profile-desc: Подписка автообновляется раз в 7 минут и чекает пинг. Просто нажми Обновить и обязательно проверь пинг.\n"
     )
 
     # Собираем всё вместе (заголовки + сервера)
