@@ -2,19 +2,22 @@ name: Update VPN Sub
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # Твои 10 минут
-  workflow_dispatch: # Кнопка ручного запуска
+    - cron: '*/10 * * * *' # Раз в 15 минут
+  workflow_dispatch: 
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Права на сохранение файла
+      contents: write
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
-
+        
+      - name: Run Filter Script
+        run: python3 main.py
+        
       - name: Commit and Push changes
         run: |
           git config --global user.name 'GitHub Action'
