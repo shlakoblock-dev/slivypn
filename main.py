@@ -7,9 +7,13 @@ import urllib.parse
 import statistics
 import re
 import sys
+import os
+import subprocess
+import zipfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
-from pathlib import Path
+import requests
 
 # --- ИСТОЧНИКИ ---
 SOURCE_URLS = [
@@ -17,6 +21,7 @@ SOURCE_URLS = [
     "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt"
 ]
 OUTPUT_FILE = "sub.txt"
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/download/v1.8.13/Xray-linux-64.zip"
 
 # --- СЛОВАРЬ СТРАН ---
 COUNTRY_MAP = {
@@ -38,12 +43,7 @@ COUNTRY_MAP = {
     "🇧🇦": "Босния", "🇲🇰": "Македония", "🇦🇱": "Албания", "🇲🇪": "Черногория"
 }
 
-# --- БЛОК ПОДСЕТЕЙ CLOUDFLARE ---
-BAD_PREFIXES = [
-    "104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", 
-    "162.158.", "198.41.", "190.93.", "197.234.", "108.162.", 
-    "131.0.72.", "103.21.", "103.22.", "103.31.", "173.245."
-]
+BAD_PREFIXES = ["104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", "162.158.", "198.41."]
 
 def log(msg):
     print(msg)
@@ -77,170 +77,151 @@ def rename_server(uri):
         if flag_match:
             flag = flag_match.group(0)
             country = COUNTRY_MAP.get(flag, "Неизвестно")
-            new_name = f"{flag} {country} [{host}]".strip()
-            return parts[0] + '#' + urllib.parse.quote(new_name)
+            return parts[0] + '#' + urllib.parse.quote(f"{flag} {country} [{host}]".strip())
     return parts[0] + '#' + urllib.parse.quote(f"🌍 Неизвестно [{host}]")
 
-def get_all_configs():
-    all_configs = set()
-    for url in SOURCE_URLS:
-        configs = get_configs_from_url(url)
-        for c in configs:
-            all_configs.add(rename_server(c))
-    return list(all_configs)
+def parse_uri_to_xray(uri):
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        params = urllib.parse.parse_qs(parsed.query)
+        
+        outbound = {
+            "protocol": parsed.scheme,
+            "settings": {},
+            "streamSettings": {"network": params.get('type', ['tcp'])[0]}
+        }
+        
+        sec = params.get('security', ['none'])[0]
+        if sec == 'tls':
+            outbound['streamSettings']['security'] = 'tls'
+            if 'sni' in params: outbound['streamSettings']['tlsSettings'] = {"serverName": params['sni'][0]}
+        elif sec == 'reality':
+            outbound['streamSettings']['security'] = 'reality'
+            outbound['streamSettings']['realitySettings'] = {
+                "publicKey": params.get('pbk', [''])[0],
+                "fingerprint": params.get('fp', ['chrome'])[0],
+                "serverName": params.get('sni', [''])[0],
+                "shortId": params.get('sid', [''])[0]
+            }
 
-def get_host_port(uri):
-    if uri.startswith("vmess://"):
-        try:
+        if parsed.scheme == 'vless':
+            outbound['settings'] = {
+                "vnext": [{
+                    "address": parsed.hostname,
+                    "port": parsed.port,
+                    "users": [{"id": parsed.username, "encryption": "none", "flow": params.get('flow', [''])[0]}]
+                }]
+            }
+        elif parsed.scheme == 'vmess':
             b64 = uri[8:]
             if "?" in b64: b64 = b64.split("?")[0]
             data = json.loads(base64.b64decode(b64 + "==").decode('utf-8'))
-            return data.get("add"), int(data.get("port"))
-        except: return None
-    elif "://" in uri:
-        try:
-            parsed = urllib.parse.urlparse(uri)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, int(parsed.port)
-        except: pass
-    return None
-
-def tcp_ping_once(host_port):
-    if not host_port: return -1
-    host, port = host_port
-    try:
-        start = time.time()
-        with socket.create_connection((host, port), timeout=1.0):
-            return (time.time() - start) * 1000
-    except:
-        return -1
+            outbound['settings'] = {
+                "vnext": [{
+                    "address": data['add'],
+                    "port": int(data['port']),
+                    "users": [{"id": data['id'], "alterId": int(data.get('aid', 0)), "security": data.get('scy', 'auto')}]
+                }]
+            }
+            if data.get('net') == 'ws':
+                outbound['streamSettings']['network'] = 'ws'
+                outbound['streamSettings']['wsSettings'] = {"path": data.get('path', '/'), "headers": {"Host": data.get('host', '')}}
+                if data.get('tls') == 'tls':
+                    outbound['streamSettings']['security'] = 'tls'
+                    outbound['streamSettings']['tlsSettings'] = {"serverName": data.get('sni', '')}
+        return outbound
+    except Exception:
+        return None
 
 def main():
-    log("="*40)
-    log("[START] Начинаем процесс обновления подписки")
-    log("="*40)
-    
-    log("[1/4] Скачиваем конфиги...")
-    raw_configs = get_all_configs()
-    if not raw_configs:
-        log("[ERROR] Не удалось скачать ни одного конфига.")
-        return
+    log("Скачиваем и готовим Xray...")
+    os.makedirs("xray_bin", exist_ok=True)
+    xray_zip = "xray.zip"
+    if not os.path.exists(xray_zip) and not os.path.exists("xray_bin/xray"):
+        urllib.request.urlretrieve(XRAY_URL, xray_zip)
+        with zipfile.ZipFile(xray_zip, 'r') as zip_ref:
+            zip_ref.extractall("xray_bin")
+        os.chmod("xray_bin/xray", 0o755)
 
-    log(f"[2/4] Быстрый TCP-отсев и фильтр Cloudflare...")
-    tcp_alive = []
-    for uri in raw_configs:
-        if not (uri.startswith("vless://") or uri.startswith("vmess://")):
-            continue
-            
-        hp = get_host_port(uri)
-        if not hp: continue
+    raw_configs = []
+    for url in SOURCE_URLS:
+        raw_configs.extend(get_configs_from_url(url))
+
+    filtered = [rename_server(c) for c in raw_configs if c.startswith("vless://") or c.startswith("vmess://")]
+    log(f"Всего серверов: {len(filtered)}")
+
+    inbounds, outbounds, rules, valid_uris = [], [], [], []
+    
+    for i, uri in enumerate(filtered):
+        host = urllib.parse.urlparse(uri).hostname if uri.startswith("vless") else "vmess"
+        if any(host.startswith(b) for b in BAD_PREFIXES): continue
+
+        out = parse_uri_to_xray(uri)
+        if not out: continue
         
-        host = hp[0]
-        is_bad = False
-        for bad in BAD_PREFIXES:
-            if host.startswith(bad):
-                is_bad = True
-                break
-        if is_bad: continue
-            
-        if tcp_ping_once(hp) > 0:
-            tcp_alive.append(uri)
-    
-    log(f"   Осталось после фильтров: {len(tcp_alive)} серверов.")
-
-    if not tcp_alive:
-        log("[ERROR] Ни один сервер не прошел проверку.")
-        return
-
-    log(f"[3/4] Запускаем РЕАЛЬНЫЙ Xray-тест (через gstatic.com)...")
-    
-    try:
-        from python_v2ray.downloader import BinaryDownloader
-        from python_v2ray.tester import ConnectionTester
-        from python_v2ray.config_parser import parse_uri
-    except ImportError:
-        log("[ERROR] Библиотека python-v2ray не установлена. Добавь 'python-v2ray' в requirements.txt")
-        return
-
-    project_root = Path("./")
-    downloader = BinaryDownloader(project_root)
-    downloader.ensure_all()
-
-    tester = ConnectionTester(
-        vendor_path=str(project_root / "vendor"),
-        core_engine_path=str(project_root / "core_engine")
-    )
-
-    parsed_data = []
-    for uri in tcp_alive:
-        p = parse_uri(uri)
-        if p:
-            parsed_data.append((uri, p))
-
-    all_alive = []
-    chunk_size = 20 
-    
-    for i in range(0, len(parsed_data), chunk_size):
-        chunk = parsed_data[i:i + chunk_size]
-        uris = [x[0] for x in chunk]
-        configs = [x[1] for x in chunk]
+        port = 20000 + len(valid_uris)
+        out['tag'] = f"proxy_{port}"
+        outbounds.append(out)
         
-        log(f"   Тестируем пачку {i//chunk_size + 1} ({len(chunk)} серверов)...")
-        
+        inbounds.append({"listen": "127.0.0.1", "port": port, "protocol": "socks", "tag": f"socks_{port}"})
+        rules.append({"type": "field", "inboundTag": [f"socks_{port}"], "outboundTag": f"proxy_{port}"})
+        valid_uris.append(uri)
+
+    config = {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
+        "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
+        "routing": {"rules": rules}
+    }
+    
+    with open("xray_config.json", "w") as f:
+        json.dump(config, f)
+
+    log("Запускаем Xray...")
+    proc = subprocess.Popen(["./xray_bin/xray", "-c", "xray_config.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3) # Даем Xray подняться
+
+    def test_port(uri, port):
         try:
-            try:
-                results = tester.test_uris(configs, test_url="https://www.gstatic.com/generate_204")
-            except TypeError:
-                results = tester.test_uris(configs)
+            proxies = {'http': f'socks5h://127.0.0.1:{port}', 'https': f'socks5h://127.0.0.1:{port}'}
+            start = time.time()
+            r = requests.head('https://www.gstatic.com/generate_204', proxies=proxies, timeout=4)
+            if r.status_code == 204:
+                return uri, (time.time() - start) * 1000
+        except:
+            return None, -1
+        return None, -1
 
-            if results:
-                for j, res in enumerate(results):
-                    if res.get('status') == 'success' and res.get('ping_ms', -1) > 0:
-                        all_alive.append((uris[j], res['ping_ms']))
-        except Exception as e:
-            log(f"   [WARN] Пачка упала: {e}")
-            
-        time.sleep(1.0) 
+    log("Тестируем порты...")
+    alive = []
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(test_port, uri, 20000+i) for i, uri in enumerate(valid_uris)]
+        for f in futures:
+            u, p = f.result()
+            if u: alive.append((u, p))
 
-    log(f"   Xray подтвердил работу {len(all_alive)} серверов.")
+    proc.terminate()
+    log(f"Живых серверов: {len(alive)}")
 
-    # --- ЭТАП 4: ФИЛЬТРАЦИЯ И СОРТИРОВКА ---
-    log(f"[4/4] Фильтрация и сортировка...")
-    all_alive.sort(key=lambda x: x[1])
+    alive.sort(key=lambda x: x[1])
+    final_uris, country_counts = [], defaultdict(int)
     
-    final_uris = []
-    country_counts = defaultdict(int)
-    MAX_PER_COUNTRY = 3
-    TARGET_COUNT = 15 # <--- ИЗМЕНЕНО ТУТ (было 25)
-    
-    for uri, ping in all_alive:
-        if len(final_uris) >= TARGET_COUNT:
-            break
-            
+    for uri, ping in alive:
+        if len(final_uris) >= 15: break
         flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', urllib.parse.unquote(uri.split('#')[1]) if '#' in uri else "")
         flag = flag_match.group(0) if flag_match else "Unknown"
-        
-        if country_counts[flag] >= MAX_PER_COUNTRY:
-            continue
-            
+        if country_counts[flag] >= 3: continue
         final_uris.append(uri)
         country_counts[flag] += 1
-        
-        name = urllib.parse.unquote(uri.split('#')[1]) if '#' in uri else "Без имени"
-        log(f"   [В СПИСКЕ] {name} | Реальный пинг: {ping:.0f}ms")
+        log(f"[В СПИСКЕ] {urllib.parse.unquote(uri.split('#')[1])} | Пинг: {ping:.0f}ms")
 
-    log(f"[DONE] Отобрано {len(final_uris)} лучших серверов.")
-    
-    header = (
-        "#profile-title: Sлiвы VPN ~ Drun Tier\n"
-        "#profile-update-interval: 1\n"
-        "#profile-desc: Подписка автообновляется и чекает пинг. Просто нажми Обновить.\n"
-    )
-
+    header = "#profile-title: Sлiвы VPN ~ Drun Tier\n#profile-update-interval: 1\n#profile-desc: Подписка автообновляется. Нажми Обновить.\n"
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(final_uris))
-        
-    log(f"[SAVE] Файл {OUTPUT_FILE} успешно записан.")
+    log("Файл сохранен!")
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
