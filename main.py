@@ -136,7 +136,6 @@ def main():
         if not hp: continue
         
         host = hp[0]
-        # Выкидываем Cloudflare
         is_bad = False
         for bad in BAD_PREFIXES:
             if host.startswith(bad):
@@ -167,11 +166,10 @@ def main():
     downloader = BinaryDownloader(project_root)
     downloader.ensure_all()
 
-    # ВАЖНО: Указываем тестовый URL как в Happ!
+    # УБРАЛИ test_url ОТСЮДА
     tester = ConnectionTester(
         vendor_path=str(project_root / "vendor"),
-        core_engine_path=str(project_root / "core_engine"),
-        test_url="https://www.gstatic.com/generate_204" # <--- ВОТ ОНО
+        core_engine_path=str(project_root / "core_engine")
     )
 
     parsed_data = []
@@ -181,21 +179,30 @@ def main():
             parsed_data.append((uri, p))
 
     all_alive = []
-    chunk_size = 10 # Проверяем по 10 штук, чтобы не вешать систему
+    # Делаем пачки ПО 50, чтобы не спамить запусками Xray, но и не вешать его
+    chunk_size = 50 
     
     for i in range(0, len(parsed_data), chunk_size):
         chunk = parsed_data[i:i + chunk_size]
         uris = [x[0] for x in chunk]
         configs = [x[1] for x in chunk]
         
+        log(f"   Тестируем пачку {i//chunk_size + 1} ({len(chunk)} серверов)...")
+        
         try:
-            results = tester.test_uris(configs)
+            # ПЕРЕДАЕМ test_url СЮДА (если библиотека это поддерживает)
+            # Если нет - вызов все равно сработает с дефолтным URL
+            try:
+                results = tester.test_uris(configs, test_url="https://www.gstatic.com/generate_204")
+            except TypeError:
+                results = tester.test_uris(configs)
+
             if results:
                 for j, res in enumerate(results):
                     if res.get('status') == 'success' and res.get('ping_ms', -1) > 0:
                         all_alive.append((uris[j], res['ping_ms']))
-        except Exception:
-            # Если Xray подавился этой пачкой (таймаут или битый конфиг), пропускаем
+        except Exception as e:
+            log(f"   [WARN] Пачка упала: {e}")
             pass
             
         time.sleep(0.5)
