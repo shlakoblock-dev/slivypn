@@ -9,6 +9,7 @@ import statistics
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 
 # --- ИСТОЧНИКИ ---
 SOURCE_URLS = [
@@ -38,7 +39,6 @@ COUNTRY_MAP = {
 }
 
 def log(msg):
-    """Печатает сообщение и сразу сбрасывает буфер в лог GitHub"""
     print(msg)
     sys.stdout.flush()
 
@@ -152,6 +152,16 @@ def check_server(uri, host_port):
             
     return None, -1
 
+def extract_country_flag(uri):
+    """Достает флаг страны из имени сервера для группировки"""
+    parts = uri.split('#')
+    if len(parts) > 1:
+        decoded_name = urllib.parse.unquote(parts[1])
+        flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', decoded_name)
+        if flag_match:
+            return flag_match.group(0)
+    return "Unknown"
+
 def main():
     log("="*40)
     log("[START] Начинаем процесс обновления подписки")
@@ -160,7 +170,7 @@ def main():
     log("[1/4] Скачиваем конфиги...")
     raw_configs = get_all_configs()
     if not raw_configs:
-        log("[ERROR] Не удалось скачать ни одного конфига. Проверь источники.")
+        log("[ERROR] Не удалось скачать ни одного конфига.")
         return
 
     log(f"[2/4] Парсим {len(raw_configs)} серверов...")
@@ -169,11 +179,11 @@ def main():
         hp = get_host_port(uri)
         if hp:
             parsed_data.append((uri, hp))
-        else:
-            pass # Ошибки парсинга не спамим
 
     log(f"[3/4] Проверяем доступность и пинг (всего {len(parsed_data)} шт)...")
-    good_uris = []
+    
+    # Здесь храним кортежи: (uri, avg_ping)
+    all_alive = []
     
     with ThreadPoolExecutor(max_workers=50) as executor:
         future_to_uri = {executor.submit(check_server, uri, hp): uri for uri, hp in parsed_data}
@@ -181,21 +191,46 @@ def main():
         completed = 0
         for future in future_to_uri:
             completed += 1
-            # Каждые 50 серверов пишем прогресс
             if completed % 50 == 0:
                 log(f"   ... проверено {completed} из {len(parsed_data)}")
                 
             try:
                 result_uri, avg_ping = future.result()
                 if result_uri:
-                    # Логируем только тех, кто прошел!
-                    name = urllib.parse.unquote(result_uri.split('#')[1]) if '#' in result_uri else "Без имени"
-                    log(f"   [ЖИВОЙ] {name} | Пинг: {avg_ping:.0f}ms")
-                    good_uris.append(result_uri)
+                    all_alive.append((result_uri, avg_ping))
             except Exception as e:
                 log(f"   [ОШИБКА ПОТОКА] {e}")
 
-    log(f"[4/4] Готово! Из {len(parsed_data)} серверов выжило {len(good_uris)}.")
+    log(f"[4/4] Фильтрация и сортировка...")
+    log(f"   Всего живых серверов: {len(all_alive)}")
+    
+    # 1. Сортируем всех живых по возрастанию пинга (самые быстрые в начале)
+    all_alive.sort(key=lambda x: x[1])
+    
+    # 2. Отбираем топ-25 с ограничением в 3 сервера на страну
+    final_uris = []
+    country_counts = defaultdict(int)
+    MAX_PER_COUNTRY = 3
+    TARGET_COUNT = 25
+    
+    for uri, ping in all_alive:
+        if len(final_uris) >= TARGET_COUNT:
+            break # Набрали 25 штук, останавливаемся
+            
+        flag = extract_country_flag(uri)
+        
+        # Если этой страны уже 3 штуки - пропускаем
+        if country_counts[flag] >= MAX_PER_COUNTRY:
+            continue
+            
+        # Добавляем сервер
+        final_uris.append(uri)
+        country_counts[flag] += 1
+        
+        name = urllib.parse.unquote(uri.split('#')[1]) if '#' in uri else "Без имени"
+        log(f"   [В СПИСКЕ] {name} | Пинг: {ping:.0f}ms")
+
+    log(f"[DONE] Отобрано {len(final_uris)} лучших серверов.")
     
     header = (
         "#profile-title: Sлiвы VPN ~ Drun Tier\n"
@@ -204,9 +239,9 @@ def main():
     )
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(header + "\n".join(good_uris))
+        f.write(header + "\n".join(final_uris))
         
-    log(f"[DONE] Файл {OUTPUT_FILE} успешно записан.")
+    log(f"[SAVE] Файл {OUTPUT_FILE} успешно записан.")
 
 if __name__ == "__main__":
     main()
