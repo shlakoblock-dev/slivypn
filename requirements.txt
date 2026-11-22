@@ -1,1 +1,2 @@
-python-v2ray
+requests
+PySocks
