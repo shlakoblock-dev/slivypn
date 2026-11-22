@@ -144,9 +144,9 @@ def check_server(uri, host_port):
         time.sleep(0.05)
     
     # Фильтр: минимум 3 успеха из 5, средний пинг <= 1000
-    if successes >= 3:
+    if successes >= 4:
         avg_ping = statistics.mean(pings)
-        if avg_ping <= 200:
+        if avg_ping <= 150:
             return uri, avg_ping
     return None, -1
 
