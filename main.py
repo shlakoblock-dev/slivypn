@@ -233,7 +233,7 @@ def main():
     final_uris = []
     country_counts = defaultdict(int)
     MAX_PER_COUNTRY = 3
-    TARGET_COUNT = 25
+    TARGET_COUNT = 15
     
     for uri, ping in all_alive:
         if len(final_uris) >= TARGET_COUNT:
