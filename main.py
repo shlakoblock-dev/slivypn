@@ -5,254 +5,194 @@ import socket
 import json
 import urllib.parse
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import sys
+import re
+from concurrent.futures import ThreadPoolExecutor
 
-# --- СЮДА ДОБАВЛЯЙ ССЫЛКИ НА СЫРЫЕ КОНФИГИ ---
+# --- СЮДА ДОБАВЛЯЙ ССЫЛКИ ---
 SOURCE_URLS = [
     "https://github.com/PizdukMod/PizdukVPN/raw/refs/heads/main/sub",
-    "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt"
+    "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt" # <-- ВСТАВЬ СЮДА ССЫЛКУ НА JSON ОТ АЕТРИС
 ]
-# ----------------------------------------------
+# ----------------------------
 
 OUTPUT_FILE = "sub.txt"
 
-# --- Параметры проверки ---
-INITIAL_PING_ATTEMPTS = 3
-INITIAL_SUCCESS_THRESHOLD = 2
-INITIAL_PING_THRESHOLD_MS = 1000
-INITIAL_TIMEOUT_SEC = 2.5
-
-FINAL_PING_ATTEMPTS = 5
-FINAL_SUCCESS_THRESHOLD = 4
-FINAL_PING_THRESHOLD_MS = 200
-FINAL_TIMEOUT_SEC = 1.5
-
-TOP_N_SERVERS_TO_RECHECK = 20 # Увеличим пул для финальной проверки, чтобы было из чего выбирать до 10
-MAX_OUTPUT_SERVERS = 10       # Максимальное количество серверов на выходе
-# --------------------------
-
-
 def get_configs_from_url(url):
-    """Скачивает и декодирует конфиги из указанного URL."""
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         with urllib.request.urlopen(req, timeout=15) as response:
-            content = response.read().decode('utf-8', errors='ignore')
+            content = response.read().decode('utf-8')
             
-            if '\n' not in content.strip() and (content.strip().startswith("vmess://") or content.strip().startswith("vless://")):
+            # Если это JSON (Aetris)
+            if content.strip().startswith("{"):
+                print(f"[JSON] Обнаружен JSON от {url}")
                 try:
-                    b64_content = content.strip()
-                    missing_padding = len(b64_content) % 4
-                    if missing_padding:
-                        b64_content += '=' * (4 - missing_padding)
+                    json_data = json.loads(content)
+                    proxy_out = None
+                    if "outbounds" in json_data:
+                        proxy_out = next((o for o in json_data["outbounds"] if o.get("protocol") in ["vless", "vmess"]), None)
+                    
+                    if proxy_out:
+                        settings = proxy_out.get("settings", {})
+                        stream = proxy_out.get("streamSettings", {})
                         
-                    decoded = base64.b64decode(b64_content).decode('utf-8', errors='ignore')
-                    if '://' in decoded:
-                        content = decoded
+                        ip = settings.get("address")
+                        port = settings.get("port")
+                        uid = settings.get("id")
+                        
+                        # Парсим имя и флаг
+                        remarks = json_data.get("remarks", "")
+                        flag = ""
+                        country = "Сервер"
+                        
+                        flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', remarks)
+                        if flag_match:
+                            flag = flag_match.group(0)
+                            
+                        country_map = {
+                            "🇩🇪": "Германия", "🇷🇺": "Россия", "🇺🇸": "США", "🇳🇱": "Нидерланды",
+                            "🇫🇮": "Финляндия", "🇸🇪": "Швеция", "🇫🇷": "Франция", "🇬🇧": "Британия",
+                            "🇯🇵": "Япония", "🇸🇬": "Сингапур", "🇹🇷": "Турция", "🇵🇱": "Польша",
+                            "🇺🇦": "Украина", "🇰🇿": "Казахстан", "🇨🇭": "Швейцария", "🇮🇹": "Италия",
+                            "🇦🇹": "Австрия", "🇪🇸": "Испания", "🇨🇦": "Канада", "🇭🇰": "Гонконг",
+                            "🇰🇷": "Корея", "🇧🇷": "Бразилия", "🇦🇺": "Австралия", "🇮🇳": "Индия"
+                        }
+                        
+                        if flag in country_map:
+                            country = country_map[flag]
+                            
+                        final_name = f"{flag} {country} [{ip}]".strip()
+                        
+                        # Собираем URI
+                        if proxy_out.get("protocol") == "vless":
+                            net = stream.get("network", "tcp")
+                            sec = stream.get("security", "none")
+                            
+                            params = [f"type={net}", f"security={sec}"]
+                            
+                            if sec == "reality":
+                                reality = stream.get("realitySettings", {})
+                                if reality.get("serverName"): params.append(f"sni={reality['serverName']}")
+                                if reality.get("publicKey"): params.append(f"pbk={reality['publicKey']}")
+                                if reality.get("shortId"): params.append(f"sid={reality['shortId']}")
+                                if reality.get("fingerprint"): params.append(f"fp={reality['fingerprint']}")
+                                
+                            if settings.get("flow"):
+                                params.append(f"flow={settings['flow']}")
+                                
+                            uri = f"vless://{uid}@{ip}:{port}?{'&'.join(params)}#{urllib.parse.quote(final_name)}"
+                            return [uri]
                 except Exception as e:
-                    print(f"[WARN] Не удалось декодировать {url[:30]}... как base64: {e}")
+                    print(f"Ошибка парсинга JSON: {e}")
+                    return []
+            
+            # Если это обычный текст (Пиздюк)
+            try:
+                decoded = base64.b64decode(content).decode('utf-8')
+                if '://' in decoded: content = decoded
+            except: pass
             
             lines = [line.strip() for line in content.splitlines() if '://' in line]
             return lines
     except Exception as e:
-        print(f"[ОШИБКА] Не удалось скачать {url[:30]}... : {e}")
+        print(f"[ОШИБКА] {url[:30]}... : {e}")
         return []
 
 def get_all_configs():
-    """Собирает все уникальные конфиги из всех указанных URL."""
     all_configs = set()
-    print(f"Скачиваем конфиги из {len(SOURCE_URLS)} источников...")
     for url in SOURCE_URLS:
         configs = get_configs_from_url(url)
-        print(f"[FETCH] Из {url} получено {len(configs)} строк.")
         for c in configs:
             all_configs.add(c)
     return list(all_configs)
 
 def get_host_port(uri):
-    """Извлекает хост и порт из URI (vmess, vless)."""
     if uri.startswith("vmess://"):
         try:
-            b64_part = uri[8:].split("?")[0]
-            missing_padding = len(b64_part) % 4
-            if missing_padding:
-                b64_part += '=' * (4 - missing_padding)
-            
-            decoded = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
+            b64 = uri[8:]
+            if "?" in b64: b64 = b64.split("?")[0]
+            decoded = base64.b64decode(b64 + "==").decode('utf-8')
             data = json.loads(decoded)
             return data.get("add"), int(data.get("port"))
-        except Exception: 
-            return None
-    elif uri.startswith("vless://"):
+        except: return None
+    elif "://" in uri:
         try:
             parsed = urllib.parse.urlparse(uri)
-            hostname = parsed.hostname
-            port = parsed.port
-            if not port:
-                port = 443
-            return hostname, port
-        except Exception: 
-            pass
+            if parsed.hostname and parsed.port:
+                return parsed.hostname, int(parsed.port)
+        except: pass
     return None
 
-def tcp_ping_once(host_port, timeout=INITIAL_TIMEOUT_SEC):
-    """Выполняет один TCP пинг к хосту:порту."""
+def tcp_ping_once(host_port):
     if not host_port: return -1
     host, port = host_port
     try:
         start = time.time()
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            return (time.time() - start) * 1000 # Возвращаем пинг в миллисекундах
-    except (socket.timeout, ConnectionRefusedError, OSError): 
-        return -1
-    except Exception: 
+        with socket.create_connection((host, port), timeout=1.5):
+            return (time.time() - start) * 1000
+    except:
         return -1
 
-def check_server(uri, host_port, attempts, success_threshold, ping_threshold, timeout):
-    """
-    Проверяет доступность сервера, выполняя несколько пингов.
-    Возвращает URI, средний пинг, и список всех успешных пингов, если сервер прошел проверку.
-    """
+def check_server(uri, host_port):
     pings = []
     successes = 0
-    
-    for _ in range(attempts): 
-        ping = tcp_ping_once(host_port, timeout=timeout)
+    for _ in range(5):
+        ping = tcp_ping_once(host_port)
         if ping > 0:
             pings.append(ping)
             successes += 1
-        time.sleep(0.1) 
+        time.sleep(0.05)
     
-    if successes >= success_threshold: 
-        if pings: 
-            avg_ping = statistics.mean(pings)
-            if avg_ping < ping_threshold: 
-                return uri, avg_ping, pings
-    return None, -1, []
-
-def initial_check(parsed_data, executor):
-    """Выполняет начальную проверку серверов."""
-    print(f"Начальная проверка {len(parsed_data)} серверов...")
-    futures = {executor.submit(check_server, uri, hp, 
-                               INITIAL_PING_ATTEMPTS, INITIAL_SUCCESS_THRESHOLD, 
-                               INITIAL_PING_THRESHOLD_MS, INITIAL_TIMEOUT_SEC): uri 
-               for uri, hp in parsed_data}
-    
-    initial_good_servers = []
-    processed_count = 0
-    total_servers = len(parsed_data)
-
-    for future in as_completed(futures):
-        uri = futures[future]
-        try:
-            result_uri, avg_ping, _ = future.result()
-            if result_uri:
-                initial_good_servers.append((result_uri, avg_ping))
-        except Exception as exc:
-            print(f'[ERROR] {uri[:70]}... сгенерировал исключение: {exc}')
-        
-        processed_count += 1
-        if processed_count % 50 == 0 or processed_count == total_servers:
-            print(f"  Проверено: {processed_count}/{total_servers} (Найдено рабочих: {len(initial_good_servers)})")
-            sys.stdout.flush() 
-
-    initial_good_servers.sort(key=lambda item: item[1]) # Сортируем по среднему пингу
-    return initial_good_servers
-
-def final_check(servers_to_recheck, executor):
-    """Выполняет финальную, более строгую проверку выбранных серверов."""
-    if not servers_to_recheck:
-        return []
-        
-    print(f"\nФинальная проверка {len(servers_to_recheck)} лучших серверов...")
-    futures = {executor.submit(check_server, uri, hp, 
-                               FINAL_PING_ATTEMPTS, FINAL_SUCCESS_THRESHOLD, 
-                               FINAL_PING_THRESHOLD_MS, FINAL_TIMEOUT_SEC): uri 
-               for uri, hp in servers_to_recheck}
-
-    final_good_servers = []
-    processed_count = 0
-    total_servers = len(servers_to_recheck)
-
-    for future in as_completed(futures):
-        uri = futures[future]
-        try:
-            result_uri, avg_ping, _ = future.result()
-            if result_uri:
-                final_good_servers.append((result_uri, avg_ping))
-        except Exception as exc:
-            print(f'[ERROR] {uri[:70]}... сгенерировал исключение: {exc}')
-        
-        processed_count += 1
-        if processed_count % 10 == 0 or processed_count == total_servers:
-            print(f"  Проверено: {processed_count}/{total_servers} (Найдено рабочих: {len(final_good_servers)})")
-            sys.stdout.flush()
-
-    final_good_servers.sort(key=lambda item: item[1]) # Сортируем по среднему пингу
-    return final_good_servers
+    # Фильтр: минимум 3 успеха из 5, средний пинг <= 1000
+    if successes >= 3:
+        avg_ping = statistics.mean(pings)
+        if avg_ping <= 200:
+            return uri, avg_ping
+    return None, -1
 
 def main():
-    """Основная функция: собирает, парсит, пингует и сохраняет рабочие серверы."""
+    print("Скачиваем конфиги...")
     raw_configs = get_all_configs()
     if not raw_configs:
-        print("Нет конфигов для обработки!")
+        print("Нет конфигов!")
         return
 
     parsed_data = []
-    print("Парсим адреса и порты...")
     for uri in raw_configs:
         hp = get_host_port(uri)
         if hp:
             parsed_data.append((uri, hp))
-        else:
-            print(f"[WARN] Не удалось распарсить URI: {uri[:70]}...")
 
-    if not parsed_data:
-        print("Не удалось распарсить ни одного сервера!")
-        return
-
-    good_uris_with_ping = []
+    print(f"Пингуем {len(parsed_data)} серверов...")
+    good_uris = []
     
-    with ThreadPoolExecutor(max_workers=60) as executor: 
-        # 1. Начальная проверка
-        initial_results = initial_check(parsed_data, executor)
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        future_to_uri = {executor.submit(check_server, uri, hp): uri for uri, hp in parsed_data}
         
-        # 2. Выбираем ТОП N серверов для финальной проверки
-        # Увеличил TOP_N_SERVERS_TO_RECHECK, чтобы было из чего выбирать до MAX_OUTPUT_SERVERS
-        servers_for_final_check = initial_results[:TOP_N_SERVERS_TO_RECHECK]
-        
-        # 3. Финальная проверка
-        final_results = final_check(servers_for_final_check, executor)
-        
-        # 4. Берем ТОП M из финально проверенных, но не более MAX_OUTPUT_SERVERS
-        good_uris_with_ping = final_results[:MAX_OUTPUT_SERVERS]
+        completed = 0
+        for future in future_to_uri:
+            completed += 1
+            if completed % 10 == 0:
+                print(f"Проверено {completed} из {len(parsed_data)}...")
+                
+            result_uri, avg_ping = future.result()
+            if result_uri:
+                good_uris.append(result_uri)
 
-    # --- ФОРМИРУЕМ ФАЙЛ С ЗАГОЛОВКАМИ ---
-    profile_title = "Sliwy VPN"
-    profile_desc = "Подписка автообновляется, проверяет пинг. Просто нажми Обновить и проверь пинг."
-
+    # --- ФОРМИРУЕМ ФАЙЛ С ЗАГОЛОВКАМИ (БЕЗ BASE64) ---
     header = (
-        f"#profile-title: {profile_title}\n"
+        "#profile-title: Sлiвы VPN ~ Drun Tier\n"
         "#profile-update-interval: 1\n"
-        f"#profile-desc: {profile_desc}\n"
+        "#profile-desc: Подписка автообновляется и чекает пинг. Просто нажми Обновить.\n"
     )
 
-    # Извлекаем только URI после сортировки
-    good_uris = [item[0] for item in good_uris_with_ping]
-    
+    # Просто склеиваем текст
     full_content = header + "\n".join(good_uris)
     
-    # Кодируем весь контент в Base64
-    encoded_content = base64.b64encode(full_content.encode('utf-8')).decode('utf-8')
-    
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write(encoded_content)
-        print(f"\nГотово! {len(good_uris)} лучших серверов упаковано в Base64 и сохранено в {OUTPUT_FILE}.")
-        print(f"Найдено {len(good_uris)} серверов после строгой проверки (максимум {MAX_OUTPUT_SERVERS}).")
-    except Exception as e:
-        print(f"[ОШИБКА] Не удалось записать в файл {OUTPUT_FILE}: {e}")
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(full_content)
+        
+    print(f"Готово! {len(good_uris)} серверов записано в открытом виде.")
 
 if __name__ == "__main__":
     main()
