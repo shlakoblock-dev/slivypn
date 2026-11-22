@@ -8,6 +8,7 @@ import sys
 import os
 import subprocess
 import zipfile
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
@@ -49,8 +50,8 @@ COUNTRY_MAP = {
     "🇸🇰": "Словакия", "🇸🇮": "Словения", "🇭🇷": "Хорватия", "🇷🇸": "Сербия",
 }
 
-BAD_PREFIXES = ["104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", "162.158.", "198.41."]
-FLAG_RE = re.compile(r'[\U0001F1E6-\U0001F1FF]{2}')
+BAD_PREFIXES  = ["104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", "162.158.", "198.41."]
+FLAG_RE       = re.compile(r'[\U0001F1E6-\U0001F1FF]{2}')
 WHITESPACE_RE = re.compile(r'\s+')
 
 _stats = defaultdict(int)
@@ -66,29 +67,55 @@ def dbg(msg):
         print("[dbg] " + str(msg), flush=True)
 
 
-# ---------- base64 / helpers ----------
+# ---------- helpers ----------
+
+def is_public_ip(host):
+    """True если host — публичный IP (не домен, не приватный)."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # не IP → домен, Xray разрешит
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
 
 def b64decode_any(s):
-    """Универсальный base64: URL-safe, URL-encoded, без padding."""
+    """Универсальный base64: URL-safe, URL-encoded, без padding.
+       ВАЖНО: unquote применяем только если результат остаётся ASCII."""
     s = s.strip()
-    # URL-encoding в URI (например %2B -> +, %3D -> =)
+
+    candidates = [s]
     try:
-        s = urllib.parse.unquote(s)
+        uq = urllib.parse.unquote(s)
+        if uq != s and uq.isascii():
+            candidates.append(uq)
+        elif uq != s:
+            dbg("b64: unquote дал non-ASCII, пропускаем этот вариант")
     except Exception:
         pass
-    # URL-safe -> standard
-    s = s.replace('-', '+').replace('_', '/')
-    # Убираем внутренние пробелы/переносы
-    s = WHITESPACE_RE.sub('', s)
 
-    pad = (-len(s)) % 4
-    if pad == 3:
-        # len % 4 == 1 — невозможно в валидном base64, значит один лишний символ
-        dbg("b64: len%4==1, обрезаем хвостовой символ")
-        s = s[:-1]
-        pad = (-len(s)) % 4
-    s += "=" * pad
-    return base64.b64decode(s, validate=False)
+    last_err = None
+    for cand in candidates:
+        try:
+            cand2 = cand.replace('-', '+').replace('_', '/')
+            cand2 = WHITESPACE_RE.sub('', cand2)
+            if not cand2.isascii():
+                continue
+            pad = (-len(cand2)) % 4
+            if pad == 3:
+                cand2 = cand2[:-1]
+                pad = (-len(cand2)) % 4
+            cand2 += "=" * pad
+            result = base64.b64decode(cand2, validate=False)
+            # проверяем что распаковалось в валидный UTF-8
+            result.decode("utf-8")
+            return result
+        except Exception as e:
+            last_err = e
+            continue
+    raise ValueError("base64 decode failed: " + str(last_err))
 
 
 def get_host(uri):
@@ -165,7 +192,6 @@ def parse_uri_to_xray(uri):
 
 
 def _apply_stream_settings(outbound, net, params_like):
-    """Заполняет transport-specific секции. params_like — dict или dict-like."""
     stream = outbound["streamSettings"]
     get = params_like.get
 
@@ -191,27 +217,15 @@ def _apply_stream_settings(outbound, net, params_like):
             "host": [h.strip() for h in first("host", "").split(",") if h.strip()],
         }
     elif net == "xhttp":
-        # XHTTP (новый транспорт Xray 24.9.30+)
         stream["xhttpSettings"] = {
             "path": first("path", "/"),
             "host": first("host", ""),
             "mode": first("mode", "auto"),
         }
-    elif net == "raw":
-        # raw = новый alias для tcp в свежих Xray
+    elif net in ("tcp", "raw"):
+        key = "rawSettings" if net == "raw" else "tcpSettings"
         if first("headerType", "") == "http":
-            stream["rawSettings"] = {
-                "header": {
-                    "type": "http",
-                    "request": {
-                        "path": [first("path", "/")],
-                        "headers": {"Host": [first("host", "")]},
-                    },
-                }
-            }
-    elif net == "tcp":
-        if first("headerType", "") == "http":
-            stream["tcpSettings"] = {
+            stream[key] = {
                 "header": {
                     "type": "http",
                     "request": {
@@ -227,17 +241,29 @@ def _parse_vless(uri):
     params = urllib.parse.parse_qs(parsed.query)
     net = params.get("type", ["tcp"])[0]
     sec = params.get("security", ["none"])[0]
+    flow = params.get("flow", [""])[0]
+    address = parsed.hostname
+
+    # !!! Xray 25+ запрещает VLESS без TLS/REALITY, если адрес — публичный IP
+    if sec in ("none", "") and is_public_ip(address):
+        _stats["vless_insecure_public_ip"] += 1
+        raise ValueError("VLESS+" + sec + " to public IP " + str(address) + " is prohibited by Xray 25+")
+
+    # flow (xtls-rprx-vision) требует TLS/REALITY
+    if flow and sec in ("none", ""):
+        _stats["vless_flow_no_tls"] += 1
+        raise ValueError("VLESS flow=" + flow + " requires TLS/REALITY")
 
     outbound = {
         "protocol": "vless",
         "settings": {
             "vnext": [{
-                "address": parsed.hostname,
+                "address": address,
                 "port": parsed.port,
                 "users": [{
                     "id": parsed.username,
                     "encryption": "none",
-                    "flow": params.get("flow", [""])[0],
+                    "flow": flow,
                 }],
             }]
         },
@@ -246,7 +272,7 @@ def _parse_vless(uri):
     stream = outbound["streamSettings"]
 
     if sec == "tls":
-        tls = {"serverName": params.get("sni", [parsed.hostname])[0]}
+        tls = {"serverName": params.get("sni", [address])[0]}
         if "alpn" in params:
             tls["alpn"] = params["alpn"][0].split(",")
         if params.get("fp", [""])[0]:
@@ -347,18 +373,6 @@ def preflight_checks(xray_bin):
         log("xray version rc=" + str(r.returncode))
         for line in (r.stdout + r.stderr).strip().splitlines()[:2]:
             log("    " + line)
-        # Проверим что xhttp поддерживается
-        test_cfg = {"inbounds": [], "outbounds": [
-            {"protocol": "freedom", "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/"}}}
-        ]}
-        with open("/tmp/_xtest.json", "w") as f:
-            json.dump(test_cfg, f)
-        rt = subprocess.run([xray_bin, "run", "-test", "-c", "/tmp/_xtest.json"],
-                            capture_output=True, text=True, timeout=15)
-        if rt.returncode == 0:
-            log("✓ Xray поддерживает xhttp")
-        else:
-            log("⚠️ Xray НЕ поддерживает xhttp — удалите xray_bin/ и перезапустите", "WARN")
     except Exception as e:
         log("Xray не запускается: " + str(e), "ERR")
         return False
@@ -467,7 +481,10 @@ def main():
         valid_uris.append(uri)
 
     log("Валидных: " + str(len(valid_uris)))
-    log("Плохой prefix: " + str(_stats["bad_prefix"]) + ", ошибок парсинга: " + str(_stats["parse_fail"]))
+    log("Плохой prefix: " + str(_stats["bad_prefix"]))
+    log("Ошибок парсинга: " + str(_stats["parse_fail"]))
+    log("  из них VLESS без TLS на публичный IP: " + str(_stats["vless_insecure_public_ip"]))
+    log("  из них VLESS flow без TLS: " + str(_stats["vless_flow_no_tls"]))
 
     if not valid_uris:
         log("Нет валидных серверов — выходим", "ERR")
@@ -494,8 +511,12 @@ def main():
     r = subprocess.run([xray_bin, "run", "-test", "-c", "xray_config.json"],
                        capture_output=True, text=True, timeout=30)
     log("rc=" + str(r.returncode))
+    # Логи Xray при валидации — только ошибки и первую строку (warnings про deprecated не нужны)
     if r.stdout.strip():
-        for line in r.stdout.strip().splitlines():
+        lines = r.stdout.strip().splitlines()
+        # фильтруем Warning-строки
+        important = [l for l in lines if "Warning" not in l and "deprecated" not in l.lower()]
+        for line in important[:5]:
             log("  " + line)
     if r.stderr.strip():
         for line in r.stderr.strip().splitlines():
