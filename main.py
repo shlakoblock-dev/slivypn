@@ -2,6 +2,7 @@ import time
 import urllib.request
 import base64
 import socket
+import ssl
 import json
 import urllib.parse
 import statistics
@@ -9,7 +10,6 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
-from pathlib import Path
 
 # --- ИСТОЧНИКИ ---
 SOURCE_URLS = [
@@ -38,17 +38,18 @@ COUNTRY_MAP = {
     "🇧🇦": "Босния", "🇲🇰": "Македония", "🇦🇱": "Албания", "🇲🇪": "Черногория"
 }
 
+# --- ЖЕСТКИЙ БЛОК ПОДСЕТЕЙ CLOUDFLARE И CDN ---
+BAD_PREFIXES = [
+    "104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", 
+    "162.158.", "198.41.", "190.93.", "197.234.", "108.162.", 
+    "131.0.72.", "103.21.", "103.22.", "103.31.", "173.245."
+]
+# Блокируем фейковые домены, используемые для фронтинга
+BAD_DOMAINS = ["chatgpt.com", "cloudflare.com", "workers.dev", "pages.dev", "google.com", "apple.com"]
+
 def log(msg):
     print(msg)
     sys.stdout.flush()
-
-def is_cloudflare(host):
-    """Проверяем, принадлежит ли IP к Cloudflare"""
-    cf_prefixes = ["104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", "162.158.", "198.41.", "190.93.", "197.234.", "108.162."]
-    for prefix in cf_prefixes:
-        if host.startswith(prefix):
-            return True
-    return False
 
 def get_configs_from_url(url):
     try:
@@ -90,118 +91,104 @@ def get_all_configs():
             all_configs.add(rename_server(c))
     return list(all_configs)
 
-def get_host_port(uri):
+def get_host_port_sni(uri):
     if uri.startswith("vmess://"):
         try:
             b64 = uri[8:]
             if "?" in b64: b64 = b64.split("?")[0]
             data = json.loads(base64.b64decode(b64 + "==").decode('utf-8'))
-            return data.get("add"), int(data.get("port"))
-        except: return None
+            return data.get("add"), int(data.get("port")), data.get("sni", data.get("host", data.get("add")))
+        except: return None, None, None
     elif "://" in uri:
         try:
             parsed = urllib.parse.urlparse(uri)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, int(parsed.port)
+            query = urllib.parse.parse_qs(parsed.query)
+            sni = query.get('sni', [None])[0] or query.get('host', [None])[0] or parsed.hostname
+            return parsed.hostname, int(parsed.port), sni
         except: pass
-    return None
+    return None, None, None
 
-def tcp_ping_once(host_port):
-    if not host_port: return -1
-    host, port = host_port
+def tls_ping_with_sni(host, port, sni):
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    # Разрешаем TLS 1.3 и 1.2 для совместимости с Reality
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    
     try:
         start = time.time()
-        with socket.create_connection((host, port), timeout=1.0):
-            return (time.time() - start) * 1000
+        with socket.create_connection((host, port), timeout=1.5) as sock:
+            with context.wrap_socket(sock, server_hostname=sni) as ssock:
+                return (time.time() - start) * 1000
     except:
         return -1
+
+def check_server(uri):
+    host, port, sni = get_host_port_sni(uri)
+    if not host or not port or not sni:
+        return None, -1
+
+    # 1. Проверка по черному списку IP (Cloudflare)
+    for bad in BAD_PREFIXES:
+        if host.startswith(bad):
+            return None, -1
+            
+    # 2. Проверка по черному списку доменов (фейковый фрондинг)
+    for bad in BAD_DOMAINS:
+        if bad in host.lower() or bad in str(sni).lower():
+            return None, -1
+
+    # 3. Проверяем 3 раза
+    pings = []
+    success = 0
+    for _ in range(3):
+        ping = tls_ping_with_sni(host, port, sni)
+        if ping > 0:
+            pings.append(ping)
+            success += 1
+        time.sleep(0.1)
+
+    # Условие: минимум 2 успешных TLS-хендшейка из 3
+    if success >= 2:
+        avg_ping = statistics.mean(pings)
+        if avg_ping < 500: # Поднял до 500, так как 150 отсекало почти всё
+            return uri, avg_ping
+            
+    return None, -1
 
 def main():
     log("="*40)
     log("[START] Начинаем процесс обновления подписки")
     log("="*40)
     
-    log("[1/4] Скачиваем конфиги...")
+    log("[1/3] Скачиваем конфиги...")
     raw_configs = get_all_configs()
     if not raw_configs:
         log("[ERROR] Не удалось скачать ни одного конфига.")
         return
 
-    log(f"[2/4] Быстрый TCP-отсев и фильтр Cloudflare...")
-    tcp_alive = []
-    for uri in raw_configs:
-        # Оставляем только VLESS и VMESS
-        if not (uri.startswith("vless://") or uri.startswith("vmess://")):
-            continue
-            
-        hp = get_host_port(uri)
-        if not hp: continue
-        
-        host = hp[0]
-        # Выкидываем Cloudflare
-        if is_cloudflare(host):
-            continue
-            
-        if tcp_ping_once(hp) > 0:
-            tcp_alive.append(uri)
-    
-    log(f"   Осталось после фильтров: {len(tcp_alive)} серверов.")
+    filtered_configs = [c for c in raw_configs if c.startswith("vless://") or c.startswith("vmess://")]
+    log(f"   Всего серверов после фильтра протоколов: {len(filtered_configs)}")
 
-    if not tcp_alive:
-        log("[ERROR] Ни один сервер не прошел проверку.")
-        return
-
-    log(f"[3/4] Запускаем РЕАЛЬНЫЙ Xray-тест маленькими пачками...")
-    
-    try:
-        from python_v2ray.downloader import BinaryDownloader
-        from python_v2ray.tester import ConnectionTester
-        from python_v2ray.config_parser import parse_uri
-    except ImportError:
-        log("[ERROR] Библиотека python-v2ray не установлена. Добавь 'python-v2ray' в requirements.txt")
-        return
-
-    project_root = Path("./")
-    downloader = BinaryDownloader(project_root)
-    downloader.ensure_all()
-
-    tester = ConnectionTester(
-        vendor_path=str(project_root / "vendor"),
-        core_engine_path=str(project_root / "core_engine")
-    )
-
-    # Парсим валидные конфиги
-    parsed_data = []
-    for uri in tcp_alive:
-        p = parse_uri(uri)
-        if p:
-            parsed_data.append((uri, p))
-
+    log(f"[2/3] Проверяем TLS/Reality доступность (всего {len(filtered_configs)} шт)...")
     all_alive = []
-    chunk_size = 5 # Тестируем ПО 5 ШТУК, чтобы Xray не падал
     
-    for i in range(0, len(parsed_data), chunk_size):
-        chunk = parsed_data[i:i + chunk_size]
-        uris = [x[0] for x in chunk]
-        configs = [x[1] for x in chunk]
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        future_to_uri = {executor.submit(check_server, uri): uri for uri in filtered_configs}
         
-        try:
-            results = tester.test_uris(configs)
-            if results:
-                for j, res in enumerate(results):
-                    if res.get('status') == 'success' and res.get('ping_ms', -1) > 0:
-                        all_alive.append((uris[j], res['ping_ms']))
-        except Exception:
-            # Если Xray подавился этой пачкой, просто идем дальше
-            continue
-            
-        # Небольшая пауза, чтобы GitHub Actions не забанил за перегрузку
-        time.sleep(0.5)
+        completed = 0
+        for future in future_to_uri:
+            completed += 1
+            if completed % 50 == 0:
+                log(f"   ... проверено {completed} из {len(filtered_configs)}")
+                
+            result_uri, avg_ping = future.result()
+            if result_uri:
+                all_alive.append((result_uri, avg_ping))
 
-    log(f"   Xray подтвердил работу {len(all_alive)} серверов.")
+    log(f"   Успешно прошли проверку: {len(all_alive)} серверов.")
 
-    # --- ЭТАП 4: ФИЛЬТРАЦИЯ И СОРТИРОВКА ---
-    log(f"[4/4] Фильтрация и сортировка...")
+    log(f"[3/3] Фильтрация и сортировка...")
     all_alive.sort(key=lambda x: x[1])
     
     final_uris = []
@@ -223,7 +210,7 @@ def main():
         country_counts[flag] += 1
         
         name = urllib.parse.unquote(uri.split('#')[1]) if '#' in uri else "Без имени"
-        log(f"   [В СПИСКЕ] {name} | Реальный пинг: {ping:.0f}ms")
+        log(f"   [В СПИСКЕ] {name} | Пинг: {ping:.0f}ms")
 
     log(f"[DONE] Отобрано {len(final_uris)} лучших серверов.")
     
