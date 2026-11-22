@@ -376,6 +376,7 @@ def main():
         [xray_bin, "run", "-c", "xray_config.json"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+    )
 import time
 import urllib.request
 import base64
