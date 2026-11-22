@@ -115,31 +115,7 @@ def tcp_ping_once(host_port):
     except:
         return -1
 
-# Глобальная переменная для тестера, чтобы не передавать её в каждый поток
-global_tester = None
-
-def test_chunk_thread(chunk):
-    uris = [x[0] for x in chunk]
-    configs = [x[1] for x in chunk]
-    results = []
-    try:
-        # Передаем URL, который использует Happ
-        try:
-            res = global_tester.test_uris(configs, test_url="https://www.gstatic.com/generate_204")
-        except TypeError:
-            res = global_tester.test_uris(configs)
-            
-        if res:
-            for j, r in enumerate(res):
-                if r.get('status') == 'success' and r.get('ping_ms', -1) > 0:
-                    results.append((uris[j], r['ping_ms']))
-    except Exception:
-        pass # Если пачка упала, просто возвращаем пустой список
-    return results
-
 def main():
-    global global_tester
-
     log("="*40)
     log("[START] Начинаем процесс обновления подписки")
     log("="*40)
@@ -190,7 +166,7 @@ def main():
     downloader = BinaryDownloader(project_root)
     downloader.ensure_all()
 
-    global_tester = ConnectionTester(
+    tester = ConnectionTester(
         vendor_path=str(project_root / "vendor"),
         core_engine_path=str(project_root / "core_engine")
     )
@@ -202,27 +178,29 @@ def main():
             parsed_data.append((uri, p))
 
     all_alive = []
+    chunk_size = 20 
     
-    # ДРОБИМ НА ПАЧКИ ПО 3 СЕРВЕРА
-    chunk_size = 3 
-    chunks = [parsed_data[i:i + chunk_size] for i in range(0, len(parsed_data), chunk_size)]
-    
-    log(f"   Разбили на {len(chunks)} пачек по 3 сервера.")
-    log(f"   Запускаем тестирование в 10 потоков...")
-    
-    # Запускаем тестирование пачек в 10 потоков одновременно
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(test_chunk_thread, chunk) for chunk in chunks]
+    for i in range(0, len(parsed_data), chunk_size):
+        chunk = parsed_data[i:i + chunk_size]
+        uris = [x[0] for x in chunk]
+        configs = [x[1] for x in chunk]
         
-        completed = 0
-        for future in futures:
-            completed += 1
-            if completed % 10 == 0:
-                log(f"   ... проверено пачек: {completed} из {len(chunks)}")
-                
-            res = future.result()
-            if res:
-                all_alive.extend(res)
+        log(f"   Тестируем пачку {i//chunk_size + 1} ({len(chunk)} серверов)...")
+        
+        try:
+            try:
+                results = tester.test_uris(configs, test_url="https://www.gstatic.com/generate_204")
+            except TypeError:
+                results = tester.test_uris(configs)
+
+            if results:
+                for j, res in enumerate(results):
+                    if res.get('status') == 'success' and res.get('ping_ms', -1) > 0:
+                        all_alive.append((uris[j], res['ping_ms']))
+        except Exception as e:
+            log(f"   [WARN] Пачка упала: {e}")
+            
+        time.sleep(1.0) 
 
     log(f"   Xray подтвердил работу {len(all_alive)} серверов.")
 
@@ -233,7 +211,7 @@ def main():
     final_uris = []
     country_counts = defaultdict(int)
     MAX_PER_COUNTRY = 3
-    TARGET_COUNT = 15
+    TARGET_COUNT = 15 # <--- ИЗМЕНЕНО ТУТ (было 25)
     
     for uri, ping in all_alive:
         if len(final_uris) >= TARGET_COUNT:
