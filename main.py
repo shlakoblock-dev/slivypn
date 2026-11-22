@@ -38,8 +38,14 @@ COUNTRY_MAP = {
     "🇧🇦": "Босния", "🇲🇰": "Македония", "🇦🇱": "Албания", "🇲🇪": "Черногория"
 }
 
-# Префиксы Cloudflare (через них VPN не пашет)
-BAD_IPS = ["104.", "172.6", "172.7", "188.114."]
+# --- ЖЕСТКИЙ БЛОК ПОДСЕТЕЙ CLOUDFLARE И CDN ---
+BAD_PREFIXES = [
+    "104.", "172.6", "172.7", "188.114.", "141.101.", "141.193.", 
+    "162.158.", "198.41.", "190.93.", "197.234.", "108.162.", 
+    "131.0.72.", "103.21.", "103.22.", "103.31.", "173.245."
+]
+# Также блокируем известные фейковые домены, используемые для фронтинга
+BAD_DOMAINS = ["chatgpt.com", "cloudflare.com", "workers.dev", "pages.dev"]
 
 def log(msg):
     print(msg)
@@ -115,16 +121,21 @@ def tls_ping_with_sni(host, port, sni):
         return -1
 
 def check_server(uri):
-    # 1. Отсеиваем CDN
-    for bad in BAD_IPS:
-        if bad in uri:
-            return None, -1
-
     host, port, sni = get_host_port_sni(uri)
     if not host or not port or not sni:
         return None, -1
 
-    # 2. Проверяем 3 раза
+    # 1. Проверка по черному списку IP (Cloudflare)
+    for bad in BAD_PREFIXES:
+        if host.startswith(bad):
+            return None, -1
+            
+    # 2. Проверка по черному списку доменов (фейковый фрондинг)
+    for bad in BAD_DOMAINS:
+        if bad in host or bad in str(sni):
+            return None, -1
+
+    # 3. Проверяем 3 раза
     pings = []
     success = 0
     for _ in range(3):
@@ -137,7 +148,7 @@ def check_server(uri):
     # Условие: 2 успешных TLS-хендшейка из 3
     if success >= 2:
         avg_ping = statistics.mean(pings)
-        if avg_ping < 300: # Немного подняли, иначе выживших не будет
+        if avg_ping < 300: 
             return uri, avg_ping
             
     return None, -1
@@ -153,7 +164,6 @@ def main():
         log("[ERROR] Не удалось скачать ни одного конфига.")
         return
 
-    # Оставляем только VLESS и VMESS
     filtered_configs = [c for c in raw_configs if c.startswith("vless://") or c.startswith("vmess://")]
     log(f"   Всего серверов после фильтра протоколов: {len(filtered_configs)}")
 
@@ -175,7 +185,6 @@ def main():
 
     log(f"   Успешно прошли проверку: {len(all_alive)} серверов.")
 
-    # --- ЭТАП 3: ФИЛЬТРАЦИЯ И СОРТИРОВКА ---
     log(f"[3/3] Фильтрация и сортировка...")
     all_alive.sort(key=lambda x: x[1])
     
@@ -212,9 +221,6 @@ def main():
         f.write(header + "\n".join(final_uris))
         
     log(f"[SAVE] Файл {OUTPUT_FILE} успешно записан.")
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
