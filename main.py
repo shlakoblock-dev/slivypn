@@ -2,7 +2,6 @@ import time
 import urllib.request
 import base64
 import socket
-import ssl
 import json
 import urllib.parse
 import statistics
@@ -10,6 +9,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from pathlib import Path
 
 # --- ИСТОЧНИКИ ---
 SOURCE_URLS = [
@@ -58,20 +58,22 @@ def get_configs_from_url(url):
 
 def rename_server(uri):
     parts = uri.split('#')
+    host = ""
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        host = parsed.hostname or ""
+    except: pass
+
     if len(parts) > 1:
         decoded_name = urllib.parse.unquote(parts[1])
         flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', decoded_name)
         if flag_match:
             flag = flag_match.group(0)
-            country = COUNTRY_MAP.get(flag, "Сервер")
-            host = ""
-            try:
-                parsed = urllib.parse.urlparse(uri)
-                host = parsed.hostname or ""
-            except: pass
+            country = COUNTRY_MAP.get(flag, "Неизвестно")
             new_name = f"{flag} {country} [{host}]".strip()
             return parts[0] + '#' + urllib.parse.quote(new_name)
-    return uri
+    # Если нет имени или флага
+    return parts[0] + '#' + urllib.parse.quote(f"🌍 Неизвестно [{host}]")
 
 def get_all_configs():
     all_configs = set()
@@ -109,105 +111,87 @@ def tcp_ping_once(host_port):
     except:
         return -1
 
-def tls_handshake_ping(host_port):
-    if not host_port: return -1
-    host, port = host_port
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    try:
-        start = time.time()
-        with socket.create_connection((host, port), timeout=1.0) as sock:
-            with context.wrap_socket(sock, server_hostname=host) as ssock:
-                return (time.time() - start) * 1000
-    except:
-        return -1
-
-def check_server(uri, host_port):
-    if not host_port: return None, -1
-    
-    # ЭТАП 1: Быстрая проверка
-    if tcp_ping_once(host_port) <= 0:
-        return None, -1
-    
-    # ЭТАП 2: Глубокая проверка
-    tcp_success = 0
-    tls_success = 0
-    pings = []
-    
-    for _ in range(3):
-        tcp = tcp_ping_once(host_port)
-        if tcp > 0:
-            tcp_success += 1
-            tls = tls_handshake_ping(host_port)
-            if tls > 0:
-                tls_success += 1
-                pings.append(tcp)
-        time.sleep(0.05)
-    
-    if tcp_success >= 3 and tls_success >= 2 and pings:
-        avg_ping = statistics.mean(pings)
-        if avg_ping < 150:
-            return uri, avg_ping
-            
-    return None, -1
-
-def extract_country_flag(uri):
-    """Достает флаг страны из имени сервера для группировки"""
-    parts = uri.split('#')
-    if len(parts) > 1:
-        decoded_name = urllib.parse.unquote(parts[1])
-        flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', decoded_name)
-        if flag_match:
-            return flag_match.group(0)
-    return "Unknown"
-
 def main():
     log("="*40)
     log("[START] Начинаем процесс обновления подписки")
     log("="*40)
     
+    # --- ЭТАП 1: СБОР И БЫСТРЫЙ TCP-ОТСЕВ ---
     log("[1/4] Скачиваем конфиги...")
     raw_configs = get_all_configs()
     if not raw_configs:
         log("[ERROR] Не удалось скачать ни одного конфига.")
         return
 
-    log(f"[2/4] Парсим {len(raw_configs)} серверов...")
-    parsed_data = []
+    log(f"[2/4] Быстрый TCP-отсев для {len(raw_configs)} серверов...")
+    tcp_alive = []
     for uri in raw_configs:
         hp = get_host_port(uri)
-        if hp:
-            parsed_data.append((uri, hp))
-
-    log(f"[3/4] Проверяем доступность и пинг (всего {len(parsed_data)} шт)...")
+        if hp and tcp_ping_once(hp) > 0:
+            tcp_alive.append(uri)
     
-    # Здесь храним кортежи: (uri, avg_ping)
+    log(f"   TCP-порт открыт у {len(tcp_alive)} серверов.")
+
+    if not tcp_alive:
+        log("[ERROR] Ни один сервер не прошел TCP-проверку.")
+        return
+
+    # --- ЭТАП 2: РЕАЛЬНАЯ ПРОВЕРКА ЧЕРЕЗ XRAY ---
+    log(f"[3/4] Запускаем Xray-тест для {len(tcp_alive)} живых серверов...")
+    
+    # Импортируем библиотеку (она должна быть установлена)
+    try:
+        from python_v2ray.downloader import BinaryDownloader
+        from python_v2ray.tester import ConnectionTester
+        from python_v2ray.config_parser import parse_uri
+    except ImportError:
+        log("[ERROR] Библиотека python-v2ray не установлена. Добавь 'python-v2ray' в requirements.txt")
+        return
+
+    project_root = Path("./")
+    try:
+        downloader = BinaryDownloader(project_root)
+        downloader.ensure_all()
+    except Exception as e:
+        log(f"[ERROR] Не удалось скачать бинарники Xray: {e}")
+        return
+
+    parsed_configs = []
+    valid_uris = []
+    for uri in tcp_alive:
+        p = parse_uri(uri)
+        if p:
+            parsed_configs.append(p)
+            valid_uris.append(uri)
+
+    if not parsed_configs:
+        log("[ERROR] Не удалось распарсить ни один конфиг для Xray.")
+        return
+
+    tester = ConnectionTester(
+        vendor_path=str(project_root / "vendor"),
+        core_engine_path=str(project_root / "core_engine")
+    )
+
+    # Запускаем тест
+    results = tester.test_uris(parsed_configs)
+    
+    # Собираем результаты
     all_alive = []
+    if results:
+        for i, res in enumerate(results):
+            # Проверяем статус и пинг
+            if res.get('status') == 'success' and res.get('ping_ms', -1) > 0:
+                all_alive.append((valid_uris[i], res['ping_ms']))
     
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        future_to_uri = {executor.submit(check_server, uri, hp): uri for uri, hp in parsed_data}
-        
-        completed = 0
-        for future in future_to_uri:
-            completed += 1
-            if completed % 50 == 0:
-                log(f"   ... проверено {completed} из {len(parsed_data)}")
-                
-            try:
-                result_uri, avg_ping = future.result()
-                if result_uri:
-                    all_alive.append((result_uri, avg_ping))
-            except Exception as e:
-                log(f"   [ОШИБКА ПОТОКА] {e}")
+    log(f"   Xray подтвердил работу {len(all_alive)} серверов.")
 
+    # --- ЭТАП 3: ФИЛЬТРАЦИЯ И СОРТИРОВКА ---
     log(f"[4/4] Фильтрация и сортировка...")
-    log(f"   Всего живых серверов: {len(all_alive)}")
     
-    # 1. Сортируем всех живых по возрастанию пинга (самые быстрые в начале)
+    # Сортируем по пингу
     all_alive.sort(key=lambda x: x[1])
     
-    # 2. Отбираем топ-25 с ограничением в 3 сервера на страну
     final_uris = []
     country_counts = defaultdict(int)
     MAX_PER_COUNTRY = 3
@@ -215,15 +199,14 @@ def main():
     
     for uri, ping in all_alive:
         if len(final_uris) >= TARGET_COUNT:
-            break # Набрали 25 штук, останавливаемся
+            break
             
-        flag = extract_country_flag(uri)
+        flag_match = re.search(r'[\U0001F1E6-\U0001F1FF]{2}', urllib.parse.unquote(uri.split('#')[1]) if '#' in uri else "")
+        flag = flag_match.group(0) if flag_match else "Unknown"
         
-        # Если этой страны уже 3 штуки - пропускаем
         if country_counts[flag] >= MAX_PER_COUNTRY:
             continue
             
-        # Добавляем сервер
         final_uris.append(uri)
         country_counts[flag] += 1
         
