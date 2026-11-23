@@ -2,19 +2,20 @@ name: Update VPN Subscription
 
 on:
   schedule:
-    # Запуск каждый час (в 0 минут)
-    - cron: '0 */2 * * *'
-  workflow_dispatch: # Кнопка "Run workflow" для ручного запуска
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Используем твой SHA для checkout v5
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      # Полный SHA для setup-python v5 (проверенный)
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -30,5 +31,4 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add sub.txt
-          # Проверяем, были ли изменения, чтобы не коммитить пустоту
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update VPN subscription" && git push)
