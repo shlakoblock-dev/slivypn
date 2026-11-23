@@ -80,7 +80,8 @@ def extract_flags_from_name(name):
 
 def get_country_name(flag_emoji):
     try:
-        pairs = cf.reverse_lookup([flag_emoji])
+        # Передаем language='ru' для получения русского названия
+        pairs = cf.reverse_lookup([flag_emoji], language='ru')
         if pairs and pairs[0][1]:
             return pairs[0][1]
     except:
