@@ -21,7 +21,7 @@ BLACKLIST = ["cloudflare", "chatgpt", "openai", "google", "microsoft", "amazon",
 
 cf = CountryFlag()
 
-# Регулярка для поиска ВСЕХ типов конфигов
+# Регулярка для поиска ВСЕХ типов конфигов (включая vless:// и т.д.)
 PATTERN = r'(vmess://[^\s]+|vless://[^\s]+|trojan://[^\s]+|ss://[^\s]+|ssr://[^\s]+|hysteria://[^\s]+|hysteria2://[^\s]+|hy2://[^\s]+|tuic://[^\s]+|socks://[^\s]+|http://[^\s]+|https://[^\s]+|wireguard://[^\s]+)'
 
 def fetch_content(url):
@@ -29,12 +29,17 @@ def fetch_content(url):
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         text = r.text.strip()
-        if not any(text.startswith(p) for p in ["vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria", "tuic", "socks", "http", "wireguard"]):
-            try:
-                text = base64.b64decode(text + "==").decode('utf-8', errors='ignore')
-            except:
-                pass
-        return text
+        # Сначала ищем конфиги в открытом виде
+        configs = re.findall(PATTERN, text, re.IGNORECASE)
+        if configs:
+            return text # Если нашли, возвращаем как есть
+        
+        # Если не нашли, пробуем декодировать base64
+        try:
+            decoded = base64.b64decode(text + "==").decode('utf-8', errors='ignore')
+            return decoded
+        except:
+            return text
     except Exception as e:
         print(f"Ошибка загрузки {url}: {e}")
         return ""
@@ -48,17 +53,14 @@ def get_host_port(config):
             data = json.loads(base64.b64decode(config[8:] + "==").decode('utf-8'))
             return data.get("add"), int(data.get("port", 443))
         elif config.startswith("ssr://"):
-            # SSR: ssr://base64(host:port:protocol:method:obfs:pass)
             decoded = base64.b64decode(config[6:] + "==").decode('utf-8', errors='ignore')
             parts = decoded.split(':')
             if len(parts) >= 2:
                 return parts[0], int(parts[1])
         elif config.startswith(("wireguard://")):
-            # WG: wireguard://...#name
             parsed = urlparse(config)
             return parsed.hostname, parsed.port or 51820
         else:
-            # Стандартные URL-схемы (vless, trojan, ss, hysteria2, tuic и т.д.)
             parsed = urlparse(config)
             return parsed.hostname, parsed.port or (443 if parsed.scheme in ['http', 'https', 'vless', 'trojan'] else 80)
     except:
@@ -81,8 +83,15 @@ def extract_flags_from_name(name):
 
 def get_country_name(flag_emoji):
     try:
-        # Передаем language='ru' для получения русского названия
+        # Пробуем на русском
         pairs = cf.reverse_lookup([flag_emoji], language='ru')
+        if pairs and pairs[0][1]:
+            return pairs[0][1]
+    except:
+        pass
+    # Если не вышло на русском, пробуем на английском
+    try:
+        pairs = cf.reverse_lookup([flag_emoji])
         if pairs and pairs[0][1]:
             return pairs[0][1]
     except:
@@ -101,7 +110,6 @@ def process_config(config):
         return None
 
     name = ""
-    # Вытаскиваем название для каждого типа
     if config.startswith("vmess://"):
         try:
             data = json.loads(base64.b64decode(config[8:] + "==").decode('utf-8'))
@@ -113,7 +121,6 @@ def process_config(config):
             decoded = base64.b64decode(config[6:] + "==").decode('utf-8', errors='ignore')
             if "?" in decoded:
                 params = decoded.split("?")[1]
-                # В SSR имя часто в base64 в параметре remarks
                 for p in params.split("&"):
                     if p.startswith("remarks="):
                         name = base64.b64decode(p[8:] + "==").decode('utf-8', errors='ignore')
@@ -125,7 +132,7 @@ def process_config(config):
 
     flags = extract_flags_from_name(name)
     if not flags:
-        return None # Оставляем только те, где есть флаг
+        return None
 
     country_names = []
     for f in flags[:2]:
@@ -137,7 +144,6 @@ def process_config(config):
 
     new_name = " -> ".join(country_names)
 
-    # Сборка конфига обратно
     if config.startswith("vmess://"):
         try:
             data = json.loads(base64.b64decode(config[8:] + "==").decode('utf-8'))
@@ -147,7 +153,6 @@ def process_config(config):
             return None
     elif config.startswith("ssr://"):
         try:
-            # Самая сложная замена для SSR (нужно декодить/кодить параметры)
             decoded = base64.b64decode(config[6:] + "==").decode('utf-8', errors='ignore')
             base_part, params = decoded.split("?") if "?" in decoded else (decoded, "")
             new_params = []
@@ -175,7 +180,7 @@ def main():
         all_configs.extend(configs)
 
     print(f"Всего конфигов до проверки: {len(all_configs)}")
-    print("Проверка портов и фильтрация (может занять время)...")
+    print("Проверка портов и фильтрация...")
 
     valid_configs = []
     with ThreadPoolExecutor(max_workers=30) as executor:
