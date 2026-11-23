@@ -16,7 +16,6 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- ИСТОЧНИКИ ---
 SOURCE_URLS = [
     "https://github.com/PizdukMod/PizdukVPN/raw/refs/heads/main/sub",
     "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt"
@@ -70,11 +69,10 @@ def dbg(msg):
 # ---------- helpers ----------
 
 def is_public_ip(host):
-    """True если host — публичный IP (не домен, не приватный)."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return False  # не IP → домен, Xray разрешит
+        return False  # домен — Xray разрешит
     return not (
         ip.is_private or ip.is_loopback or ip.is_link_local
         or ip.is_reserved or ip.is_multicast or ip.is_unspecified
@@ -82,17 +80,12 @@ def is_public_ip(host):
 
 
 def b64decode_any(s):
-    """Универсальный base64: URL-safe, URL-encoded, без padding.
-       ВАЖНО: unquote применяем только если результат остаётся ASCII."""
     s = s.strip()
-
     candidates = [s]
     try:
         uq = urllib.parse.unquote(s)
         if uq != s and uq.isascii():
             candidates.append(uq)
-        elif uq != s:
-            dbg("b64: unquote дал non-ASCII, пропускаем этот вариант")
     except Exception:
         pass
 
@@ -105,12 +98,12 @@ def b64decode_any(s):
                 continue
             pad = (-len(cand2)) % 4
             if pad == 3:
+                # len%4==1 — невозможно для валидного base64, обрезаем хвост
                 cand2 = cand2[:-1]
                 pad = (-len(cand2)) % 4
             cand2 += "=" * pad
             result = base64.b64decode(cand2, validate=False)
-            # проверяем что распаковалось в валидный UTF-8
-            result.decode("utf-8")
+            result.decode("utf-8")  # проверка что валидный UTF-8
             return result
         except Exception as e:
             last_err = e
@@ -126,7 +119,11 @@ def get_host(uri):
             return ""
     if uri.startswith("vmess://"):
         try:
-            b64 = uri[8:].split("?", 1)[0]
+            b64 = uri[8:]
+            for sep in ("?", "#"):
+                idx = b64.find(sep)
+                if idx >= 0:
+                    b64 = b64[:idx]
             data = json.loads(b64decode_any(b64).decode("utf-8"))
             return data.get("add", "")
         except Exception:
@@ -239,18 +236,17 @@ def _apply_stream_settings(outbound, net, params_like):
 def _parse_vless(uri):
     parsed = urllib.parse.urlparse(uri)
     params = urllib.parse.parse_qs(parsed.query)
-    net = params.get("type", ["tcp"])[0]
-    sec = params.get("security", ["none"])[0]
-    flow = params.get("flow", [""])[0]
-    address = parsed.hostname
+    net = params.get("type", ["tcp"])[0].strip().lower() or "tcp"
+    sec = (params.get("security", ["none"])[0] or "none").strip().lower() or "none"
+    flow = (params.get("flow", [""])[0] or "").strip()
+    address = (parsed.hostname or "").strip()
 
-    # !!! Xray 25+ запрещает VLESS без TLS/REALITY, если адрес — публичный IP
-    if sec in ("none", "") and is_public_ip(address):
+    # Явный fast-path: security=none на публичном IP Xray отклонит всё равно
+    if sec == "none" and is_public_ip(address):
         _stats["vless_insecure_public_ip"] += 1
-        raise ValueError("VLESS+" + sec + " to public IP " + str(address) + " is prohibited by Xray 25+")
+        raise ValueError("VLESS+none to public IP " + str(address))
 
-    # flow (xtls-rprx-vision) требует TLS/REALITY
-    if flow and sec in ("none", ""):
+    if flow and sec == "none":
         _stats["vless_flow_no_tls"] += 1
         raise ValueError("VLESS flow=" + flow + " requires TLS/REALITY")
 
@@ -295,11 +291,14 @@ def _parse_vless(uri):
 
 def _parse_vmess(uri):
     b64 = uri[8:]
-    if "?" in b64:
-        b64 = b64.split("?", 1)[0]
+    # ВАЖНО: отрезаем и ? и # — иначе base64 загрязняется и len%4==1
+    for sep in ("?", "#"):
+        idx = b64.find(sep)
+        if idx >= 0:
+            b64 = b64[:idx]
 
     data = json.loads(b64decode_any(b64).decode("utf-8"))
-    net = data.get("net", "tcp")
+    net = (data.get("net") or "tcp").strip().lower() or "tcp"
 
     outbound = {
         "protocol": "vmess",
@@ -331,7 +330,7 @@ def _parse_vmess(uri):
     return outbound
 
 
-# ---------- Xray / checks ----------
+# ---------- Xray ----------
 
 def ensure_xray():
     log("Скачиваем и готовим Xray (latest)...")
@@ -389,6 +388,93 @@ def preflight_checks(xray_bin):
     return True
 
 
+def build_config(outbounds_with_uris):
+    """Собирает Xray-конфиг, присваивая порты по индексу. Возвращает (config, valid_uris)."""
+    inbounds, outbounds, rules, valid_uris = [], [], [], []
+    for i, (uri, out) in enumerate(outbounds_with_uris):
+        port = BASE_PORT + i
+        out["tag"] = "proxy_" + str(port)
+        outbounds.append(out)
+        inbounds.append({
+            "listen": "127.0.0.1", "port": port, "protocol": "socks",
+            "tag": "socks_" + str(port),
+            "settings": {"auth": "noauth", "udp": False},
+        })
+        rules.append({
+            "type": "field",
+            "inboundTag": ["socks_" + str(port)],
+            "outboundTag": "proxy_" + str(port),
+        })
+        valid_uris.append(uri)
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
+        "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
+        "routing": {"rules": rules},
+    }, valid_uris
+
+
+def validate_iteratively(xray_bin, outbounds_with_uris):
+    """Итеративно удаляет outbound-ы, которые Xray отказывается принимать."""
+    total_removed = 0
+    max_iter = len(outbounds_with_uris) + 5
+    iter_n = 0
+
+    while outbounds_with_uris and iter_n < max_iter:
+        iter_n += 1
+        config, valid_uris = build_config(outbounds_with_uris)
+        with open("xray_config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
+        try:
+            r = subprocess.run(
+                [xray_bin, "run", "-test", "-c", "xray_config.json"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            log("xray -test завис > 30s", "ERR")
+            return None, None, None
+
+        if r.returncode == 0:
+            if total_removed > 0:
+                log("✓ Конфиг валиден. Удалено Xray-несовместимых: " + str(total_removed))
+            else:
+                log("✓ Конфиг валиден с первого раза")
+            return outbounds_with_uris, valid_uris, config
+
+        text = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r'tag\s+(proxy_\d+)', text) or re.search(r'(proxy_\d+)', text)
+        if not m:
+            log("Xray отказал, но tag не найден:", "ERR")
+            for line in text.splitlines()[-5:]:
+                if "Failed" in line or "error" in line.lower() or "prohibit" in line.lower():
+                    log("  " + line, "ERR")
+            return None, None, None
+
+        bad_tag = m.group(1)
+        reason = ""
+        for line in text.splitlines():
+            if "infra/conf:" in line and ("prohibited" in line or "failed" in line.lower() or "invalid" in line.lower()):
+                reason = line.split("infra/conf:")[-1].strip()[:120]
+                break
+
+        total_removed += 1
+        _stats["rejected_by_xray"] += 1
+        dbg("Xray отклонил " + bad_tag + (": " + reason if reason else ""))
+
+        new_list = [(u, o) for (u, o) in outbounds_with_uris if o.get("tag") != bad_tag]
+        if len(new_list) == len(outbounds_with_uris):
+            log("Не могу найти " + bad_tag + " в списке", "ERR")
+            return None, None, None
+        outbounds_with_uris = new_list
+
+    if not outbounds_with_uris:
+        log("После фильтрации Xray не осталось ни одного outbound", "ERR")
+        return [], [], None
+    log("Достигнут лимит итераций (" + str(max_iter) + ")", "ERR")
+    return None, None, None
+
+
 def test_port(uri, port):
     name = urllib.parse.unquote(uri.split("#", 1)[1]) if "#" in uri else uri[:40]
     proxies = {
@@ -407,22 +493,22 @@ def test_port(uri, port):
 
         if code == 204:
             _stats["test_ok"] += 1
-            dbg("OK port " + str(port) + " " + name + " -> 204 за " + str(int(elapsed)) + "ms")
+            dbg("OK " + name + " -> 204 за " + str(int(elapsed)) + "ms")
             return uri, elapsed
         _stats["test_other"] += 1
-        dbg("FAIL port " + str(port) + " " + name + " -> HTTP " + str(code))
+        dbg("FAIL " + name + " -> HTTP " + str(code))
     except requests.exceptions.ProxyError as e:
         _stats["test_proxy_err"] += 1
-        dbg("FAIL port " + str(port) + " " + name + " -> ProxyError: " + str(e)[:100])
+        dbg("FAIL " + name + " -> ProxyError: " + str(e)[:100])
     except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout):
         _stats["test_timeout"] += 1
-        dbg("FAIL port " + str(port) + " " + name + " -> Timeout")
+        dbg("FAIL " + name + " -> Timeout")
     except requests.exceptions.ConnectionError as e:
         _stats["test_conn_err"] += 1
-        dbg("FAIL port " + str(port) + " " + name + " -> ConnError: " + str(e)[:100])
+        dbg("FAIL " + name + " -> ConnError: " + str(e)[:100])
     except Exception as e:
         _stats["test_other"] += 1
-        dbg("FAIL port " + str(port) + " " + name + " -> " + type(e).__name__)
+        dbg("FAIL " + name + " -> " + type(e).__name__)
     return None, -1
 
 
@@ -451,80 +537,47 @@ def main():
     log("После фильтра vless/vmess: " + str(len(filtered)))
 
     log("=" * 50)
-    log("СБОРКА КОНФИГА")
+    log("ПАРСИНГ")
     log("=" * 50)
-    inbounds, outbounds, rules, valid_uris = [], [], [], []
-
+    outbounds_with_uris = []
     for uri in filtered:
         host = get_host(uri)
         if host and any(host.startswith(b) for b in BAD_PREFIXES):
             _stats["bad_prefix"] += 1
             continue
-
         out = parse_uri_to_xray(uri)
         if not out:
             continue
+        outbounds_with_uris.append((uri, out))
 
-        port = BASE_PORT + len(valid_uris)
-        out["tag"] = "proxy_" + str(port)
-        outbounds.append(out)
-        inbounds.append({
-            "listen": "127.0.0.1", "port": port, "protocol": "socks",
-            "tag": "socks_" + str(port),
-            "settings": {"auth": "noauth", "udp": False},
-        })
-        rules.append({
-            "type": "field",
-            "inboundTag": ["socks_" + str(port)],
-            "outboundTag": "proxy_" + str(port),
-        })
-        valid_uris.append(uri)
+    log("После парсинга: " + str(len(outbounds_with_uris)))
+    log("  плохой prefix: " + str(_stats["bad_prefix"]))
+    log("  ошибок парсинга: " + str(_stats["parse_fail"]))
+    log("    из них VLESS+none на публичный IP: " + str(_stats["vless_insecure_public_ip"]))
+    log("    из них VLESS flow без TLS: " + str(_stats["vless_flow_no_tls"]))
 
-    log("Валидных: " + str(len(valid_uris)))
-    log("Плохой prefix: " + str(_stats["bad_prefix"]))
-    log("Ошибок парсинга: " + str(_stats["parse_fail"]))
-    log("  из них VLESS без TLS на публичный IP: " + str(_stats["vless_insecure_public_ip"]))
-    log("  из них VLESS flow без TLS: " + str(_stats["vless_flow_no_tls"]))
-
-    if not valid_uris:
+    if not outbounds_with_uris:
         log("Нет валидных серверов — выходим", "ERR")
         return
 
     net_count = defaultdict(int)
-    for o in outbounds:
+    for _, o in outbounds_with_uris:
         net_count[o["streamSettings"].get("network", "?")] += 1
     log("Транспорты: " + str(dict(net_count)))
 
-    config = {
-        "log": {"loglevel": "warning"},
-        "inbounds": inbounds,
-        "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
-        "routing": {"rules": rules},
-    }
-    with open("xray_config.json", "w") as f:
-        json.dump(config, f, indent=2)
-    log("Конфиг сохранён (" + str(os.path.getsize("xray_config.json")) + " байт)")
-
     log("=" * 50)
-    log("ВАЛИДАЦИЯ")
+    log("ИТЕРАТИВНАЯ ВАЛИДАЦИЯ XRAY")
     log("=" * 50)
-    r = subprocess.run([xray_bin, "run", "-test", "-c", "xray_config.json"],
-                       capture_output=True, text=True, timeout=30)
-    log("rc=" + str(r.returncode))
-    # Логи Xray при валидации — только ошибки и первую строку (warnings про deprecated не нужны)
-    if r.stdout.strip():
-        lines = r.stdout.strip().splitlines()
-        # фильтруем Warning-строки
-        important = [l for l in lines if "Warning" not in l and "deprecated" not in l.lower()]
-        for line in important[:5]:
-            log("  " + line)
-    if r.stderr.strip():
-        for line in r.stderr.strip().splitlines():
-            log("  " + line, "WARN" if r.returncode == 0 else "ERR")
-
-    if r.returncode != 0:
-        log("Xray НЕ принял конфиг — стоп", "ERR")
+    outbounds_with_uris, valid_uris, config = validate_iteratively(xray_bin, outbounds_with_uris)
+    if config is None:
+        log("Валидация не удалась — стоп", "ERR")
         return
+    if not outbounds_with_uris:
+        log("После Xray-фильтра ничего не осталось", "ERR")
+        return
+
+    log("Финальный конфиг: " + str(len(outbounds_with_uris)) + " серверов")
+    log("Размер: " + str(os.path.getsize("xray_config.json")) + " байт")
 
     log("=" * 50)
     log("ЗАПУСК XRAY")
@@ -548,7 +601,7 @@ def main():
     log("✓ Xray работает")
 
     log("=" * 50)
-    log("ТЕСТИРОВАНИЕ (" + str(len(valid_uris)) + " серверов, workers=" + str(MAX_WORKERS) + ")")
+    log("ТЕСТИРОВАНИЕ (" + str(len(valid_uris)) + " серверов)")
     log("=" * 50)
     alive = []
     try:
@@ -558,7 +611,7 @@ def main():
             for f in as_completed(futures):
                 done += 1
                 if done % 50 == 0:
-                    log("  обработано " + str(done) + "/" + str(len(valid_uris)) + ", живых: " + str(len(alive)))
+                    log("  " + str(done) + "/" + str(len(valid_uris)) + ", живых: " + str(len(alive)))
                 try:
                     u, p = f.result()
                     if u:
@@ -572,6 +625,50 @@ def main():
         except subprocess.TimeoutExpired:
             proc.kill()
         except Exception:
+            pass
+        xray_log.close()
+
+    log("=" * 50)
+    log("ИТОГИ")
+    log("=" * 50)
+    log("Живых: " + str(_stats["test_ok"]))
+    log("ProxyError: " + str(_stats["test_proxy_err"]))
+    log("Timeout: " + str(_stats["test_timeout"]))
+    log("ConnError: " + str(_stats["test_conn_err"]))
+    log("Другое/HTTP!=204: " + str(_stats["test_other"]))
+    log("Удалено по жалобе Xray: " + str(_stats["rejected_by_xray"]))
+
+    if not alive:
+        log("Ни один не прошёл. Смотри xray_run.log", "ERR")
+        return
+
+    alive.sort(key=lambda x: x[1])
+    final_uris, country_counts = [], defaultdict(int)
+
+    for uri, ping in alive:
+        if len(final_uris) >= MAX_SERVERS:
+            break
+        name = urllib.parse.unquote(uri.split("#", 1)[1]) if "#" in uri else ""
+        m = FLAG_RE.search(name)
+        flag = m.group(0) if m else "🌍"
+        if country_counts[flag] >= PER_COUNTRY_LIMIT:
+            continue
+        final_uris.append(uri)
+        country_counts[flag] += 1
+        log("[В СПИСКЕ] " + name + " | " + str(int(ping)) + "ms")
+
+    header = (
+        "#profile-title: Sлiвы VPN ~ Drun Tier\n"
+        "#profile-update-interval: 1\n"
+        "#profile-desc: Подписка автообновляется. Нажми Обновить.\n"
+    )
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(final_uris))
+    log("Файл " + OUTPUT_FILE + " сохранён (" + str(len(final_uris)) + " серверов)!")
+
+
+if __name__ == "__main__":
+    main()
             pass
         xray_log.close()
 
