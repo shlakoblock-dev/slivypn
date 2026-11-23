@@ -12,7 +12,8 @@ URLS = [
     "https://raw.githubusercontent.com/PizdukMod/PizdukVPN/refs/heads/main/sub",
     "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt",
     "https://raw.githubusercontent.com/s0ulcoil/HavenVPN/refs/heads/main/Haven",
-    "https://raw.githubusercontent.com/korol5028/korol-vpn/main/Pohyu.txt"
+    "https://raw.githubusercontent.com/korol5028/korol-vpn/main/Pohyu.txt",
+    "https://raw.githubusercontent.com/Buffetbarko/Universal-Proxy-Config-Parser-/main/whitelist_vpn.txt"
 ]
 OUTPUT_FILE = "sub.txt"
 TIMEOUT = 2.0
