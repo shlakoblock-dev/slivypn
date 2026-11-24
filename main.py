@@ -203,7 +203,7 @@ def main():
     print(f"Осталось после фильтрации: {len(valid_configs)}")
 
     header = (
-        "#profile-title: Sлiвы VPN ~ Drun Tier\n"
+        "#profile-title: 🍇 Sлiвы VPN ~ Admin\n"
         "#profile-update-interval: 1\n"
         "#profile-desc: Подписка автообновляется. Нажми Обновить.\n"
     )
