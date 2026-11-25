@@ -73,6 +73,36 @@ SS_METHODS = {"aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "chacha20-
 PATTERN = r'((?:vmess|vless|trojan|ss)://[^\s]+)'
 
 
+# ---------------------------------------------------------------- xray
+
+def ensure_xray():
+    """Если xray нет — сам скачивает с GitHub releases (linux-64 / macos-arm64)."""
+    global XRAY_PATH
+    if os.path.isfile(XRAY_PATH) or shutil.which(XRAY_PATH):
+        return True
+    import zipfile, platform
+    plat = "macos-arm64-v8a" if platform.system() == "Darwin" and platform.machine() == "arm64" \
+        else "macos-64" if platform.system() == "Darwin" else "linux-64"
+    url = f"https://github.com/XTLS/Xray-core/releases/latest/download/Xray-{plat}.zip"
+    dest = os.path.join(tempfile.gettempdir(), "xray-core")
+    os.makedirs(dest, exist_ok=True)
+    zpath = os.path.join(dest, "xray.zip")
+    try:
+        print(f"xray не найден, качаю: {url}")
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        with open(zpath, "wb") as f:
+            f.write(r.content)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(dest)
+        XRAY_PATH = os.path.join(dest, "xray")
+        os.chmod(XRAY_PATH, 0o755)
+        return os.path.isfile(XRAY_PATH)
+    except Exception as e:
+        print(f"Не удалось скачать xray: {e}")
+        return False
+
+
 # ---------------------------------------------------------------- утилиты
 
 def b64decode_safe(s):
@@ -467,8 +497,8 @@ def prepare(config):
 
 
 def main():
-    if not (os.path.isfile(XRAY_PATH) or shutil.which(XRAY_PATH)):
-        print(f"xray не найден ({XRAY_PATH}). Поставь Xray-core или задай XRAY_PATH.")
+    if not ensure_xray():
+        print("xray не найден и скачать не удалось. Поставь Xray-core или задай XRAY_PATH.")
         sys.exit(1)
 
     all_configs = []
